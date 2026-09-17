@@ -1,13 +1,7 @@
-"""Micro-batch Ingestion Script for NYC 311 Data:
-
-The idea of this script is to implement pagination logic with date as partition key. However, instead of downloading the 
-entire day's data which is prone to errors, and timeouts, we will implement a micro-batch ingestion approach. Meaning, we
-will download a day's data in smaller chunks, say 1000 records at a time, and save it to the S3 bucket. 
-This will help in avoiding timeouts and errors during the ingestion, and also make the ingestion process more efficient and
-manageable. Aside from that, we can also implement an idempotent ingestion process, meaning that if the ingestion process
-is interrupted or fails, we can resume the ingestion from the last successful micro-batch, instead of starting from scratch. 
-This will help in avoiding data duplication.
-
+"""
+Micro-batch ingestion of NYC 311 data into S3 (bronze layer).
+Handles pagination, crash-resume, and idempotent re-runs.
+See README.md for full design rationale.
 """
 
 import json
@@ -17,149 +11,134 @@ import boto3
 from datetime import timedelta, datetime
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv() # Load environment variables from a .env file, which is useful for storing sensitive information like API tokens.
 
+
+### Setting up the S3 client to interact with the S3 bucket. We are using LocalStack for local testing, and we are using the test credentials provided by LocalStack. The endpoint_url is set to the LocalStack S3 endpoint, and the region_name is set to us-east-1.
 s3 = boto3.client(
     "s3",
     endpoint_url="http://localhost:4566",
     aws_access_key_id="test",
-    aws_secret_access_key="test",
+    aws_secret_access_key="test", 
     region_name="us-east-1"
 )
 
-### Since this is technically a batch pipeline, we'll be ingesting data that is already present in the API
-## before the current date.
-
 current_date = datetime.now().date()
-target_date = current_date - timedelta(days=1) #Targeting the previous day's data for ingestion.
+target_date = current_date - timedelta(days=1)  # Targeting the previous day's data for ingestion. 
 
-#### Grabbing the year, month, and day from the target date to use as partition keys for the S3 bucket.
 year = target_date.strftime("%Y")
 month = target_date.strftime("%m")
 day = target_date.strftime("%d")
+target_start_date = target_date.strftime("%Y-%m-%dT00:00:00") # Setting the start of the target date for filtering records.
+target_end_date = target_date.strftime("%Y-%m-%dT23:59:59") # Setting the end of the target date for filtering records.
 
-target_start_date = target_date.strftime("%Y-%m-%dT00:00:00")
-target_end_date = target_date.strftime("%Y-%m-%dT23:59:59")
-s3_prefix = f"bronze/nyc311/{year}-{month}-{day}/"  # S3 prefix for the current date's data.
+"""
+API Settings and Details:
 
-
-## print(s3_prefix) # Uncomment this line to see the S3 prefix for the current date.
-
+The data is from NYC 311 Service Requests API, which provides information about various service requests made by the public in New York City.
+It has a limit of 1000 records per request, and we can use the $limit and $offset parameters to paginate through the data. 
+It is recommended to have an App Token to avoid rate limiting and to access more records. The API supports filtering based on date, which we will use to get the data for the target date.
+We can use SoQL-like queries to filter the data based on the created_date field, which indicates when the service request was created.
+If you would directly take the endpoint URL from the site, it will make you download the entire dataset, which is not efficient. Instead, we will use the $where parameter to filter the data based on the created_date field, and use pagination to download the data in smaller chunks.
+"""
 
 nyc_311_endpoint = "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
 
 headers = {
-    "X-App-Token": os.getenv("X-APP-TOKEN") ### Token to go beyond the 1000 records limit, and avoid rate limiting.
+    "X-App-Token": os.getenv("X-APP-TOKEN")  # Token to go beyond the 1000 records limit, and avoid rate limiting. It is stored in the .env file for security reasons.      
 }
 
+## Setting some variables for limit, offset, and page number for pagination. We will use these variables to download the data in smaller chunks, and to keep track of the progress of the ingestion process.
+
+limit = 2000
+offset = 0
+page_number = 0
+bucket = "nyc311-bucket"
+s3_prefix = f"bronze/nyc311/{year}-{month}-{day}/"
 
 
-# paged_data = [] 
-
-### Conditional check: Whether yesterday's data is already present in the S3 bucket. If yes, skip the extract and load process.
-### If not, proceed with the extract and load process.
-
-
-# objects_in_s3 = s3.list_objects_v2(Bucket="nyc311-bucket", Prefix=f"bronze/nyc311/{year}-{month}-{day}/page_{{page_number}}.json")
-
-"""Function: Load Recent data, which by the update frequency of API is yesterday, we'll 
-be loading just one day's data. Check if the data is present in the bucket,
-if so skip the EL process, if not proceed with it"""
-
-def load_recent_data():
-    page_number = 0  # Initialize the page number for pagination.
-    total_records_ingested = 0  # Initialize the total records ingested counter.
-    limit = 2000  # Set the limit for the number of records to fetch per request.
-    offset = 0  # Initialize the offset for pagination.
-
-    # s3_response = s3.list_objects_v2(Bucket="nyc311-bucket", Prefix=f"bronze/nyc311/{year}-{month}-{day}/")
-    # if any(f"bronze/nyc311/{year}-{month}-{day}/_SUCCESS" in obj['Key'] for obj in s3_response.get('Contents', [])):
-    #     print(f"Data for {year}-{month}-{day} already exists in the S3 bucket. Skipping the extract and load process.")
-    #     return
-    is_completed = False
-    success_key = f"{s3_prefix}_SUCCESS"
+def is_day_complete(s3_prefix: str) -> bool:
+    """ Returns True is _SUCCESS file available in the day's partition marking ingestion as success. 
+    We can exit the execution as the data is already available.
+    """
     try:
-        s3.head_object(Bucket="nyc311-bucket", Key=success_key)
-        is_completed = True
-    except s3.exceptions.ClientError as e:
-        if e.response['Error']['Code'] in ('404', 'NoSuchKey'):
-            print(f"Data for {year}-{month}-{day} is incomplete. Proceeding with the extract and load process.")
+        s3.head_object(Bucket=bucket, Key=f"{s3_prefix}_SUCCESS")
+        return True
+    except s3.exceptions.ClientError  as e:
+        if e.response["Error"]["Code"] in (404, 'NoSuchKey'):
+            print(f"Data for {s3_prefix} is not present. Proceeding with the EL logic")
+            return False
         else:
-            print(f"An error occurred while checking for data in the S3 bucket: {e}")
-            raise
-    if is_completed:
-        print(f"Data for {year}-{month}-{day} already exists in the S3 bucket. Skipping the extract and load process.")
-        return
+            print(f"An error occured while checking the s3 bucket, due to: {e}")
+            raise # Fail Loudly in case of other errors
 
-    print(f"Data for {year}-{month}-{day} is partially filled. Proceeding with the extract and load process.")
-    #print(f"Data for {year}-{month}-{day} not found in the S3 bucket. Proceeding with the extract and load process.")
-
-    #### 
-    # Implementing the mid-crash recovery logic. If ingestion is incomplete, this will check for the last 
-    # ingested file, and resume from there, instead of starting from scratch.
-    s3_response = s3.list_objects_v2(Bucket="nyc311-bucket", Prefix=s3_prefix)
+def get_resume_point(s3_prefix: str, limit: int) -> tuple[int, int]:
+    """
+    Scans existing page files under this prefix and returns (page_number, offset)
+    to resume from. Empty prefix -> (0, 0), i.e. start fresh.
+    """
+    s3_response = s3.list_objects_v2(Bucket = bucket, Prefix = s3_prefix)
     existing_pages = []
     if 'Contents' in s3_response:
-        for obj in s3_response['Contents']:
-            key = obj['Key']
-            if "page_" in key and key.endswith('.json'):
-                page_num = int(key.split("page_")[1].replace('.json', ''))
+        for obj in s3_response.get('Contents',[]):
+            key = obj["Key"]
+            if key.startswith(f"{s3_prefix}page_") and key.endswith(".json"):
+                page_num = int(key.split("page_")[1].replace(".json", ""))
                 existing_pages.append(page_num)
 
-    if existing_pages:
-        last_ingested_page = max(existing_pages)
-        start_page = last_ingested_page + 1
-        offset = start_page * limit
-        page_number = start_page
-        #total_records_ingested = offset  
-        print(f"Resuming ingestion from page {page_number} with offset {offset}. Total records ingested so far: {total_records_ingested}")
+        if not existing_pages:
+            return 0, 0
+
+    last_page = max(existing_pages)
+    resume_page = last_page + 1
+    return resume_page, resume_page * limit
+
+def fetch_page(offset: int, limit: int) -> list:
+    """One paginated API call. Returns parsed JSON list (empty list = no data)"""
+    params = {
+        "$limit":limit,
+        "$offset":offset,
+        "$order": "created_date ASC, unique_key ASC",
+        "$where": f"created_date > '{target_start_date}' and created_date <= '{target_end_date}'"
+    }
+    response = requests.get(nyc_311_endpoint, params=params, headers=headers, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+def write_page(s3_prefix: str, page_number:int, page_data:list) -> None:
+    """Writes one page of data as newline-delimited JSON (JSONL) -streamable, not a single giant array"""
+    key = f"{s3_prefix}page_{page_number:04d}.json"
+    body = "".join(json.dumps(record) + "\n" for record in page_data)
+    s3.put_object(Bucket=bucket, Key=key, Body=body)
+    print(f"Uploaded {len(page_data)} records to {key}")
+
+def mark_complete(s3_prefix:str) -> None:
+    """Written only after every page for the day is ingested, and succeeded, a metafile to prove that ingestion was successful"""
+    s3.put_object(Bucket=bucket, Key=f"{s3_prefix}_SUCCESS", Body=b"")
+
+def load_recent_data() -> None:
+    if is_day_complete(s3_prefix):
+        print(f"{year}-{month}-{day} already completed. Skipping... ")
+        return
+
+    page_number, offset = get_resume_point(s3_prefix, limit)
+    if page_number > 0:
+        print(f"Resuming from page {page_number}, offset {offset}")
     else:
-        start_page = 0
-        offset = 0
-        page_number = start_page
-        print("No existing pages found. Starting ingestion from the beginning.")
+        print(f"No existing data for {year}-{month}-{day}. Starting afresh.")
 
-    ####
     while True:
-        params = {
-            "$limit": limit,
-            "$offset": offset,
-            "$order": "created_date ASC, unique_key ASC",
-            "$where": f"created_date > '{target_start_date}' AND created_date <= '{target_end_date}'"
-        }
-        try:
-            nyc_311_response = requests.get(nyc_311_endpoint, headers=headers, params=params, timeout=60)
-            nyc_311_response.raise_for_status()
-            page_data = nyc_311_response.json()
-        except Exception as e:
-            print(f"Error occurred while downloading NYC 311 data: {e}")
-            raise
-
+        page_data = fetch_page(offset, limit)
         if not page_data:
-            print(f"Finished extracting data. Total records downloaded: {total_records_ingested}")
-            s3.put_object(Bucket="nyc311-bucket", Key=f"bronze/nyc311/{year}-{month}-{day}/_SUCCESS", Body=b"")
+            mark_complete(s3_prefix)
+            print(f"Finished. {year}-{month}-{day}. Marked complete")
             break
-
-        file_name = f"page_{page_number:04d}.json"
-        s3_key = f"bronze/nyc311/{year}-{month}-{day}/{file_name}"
-
-        try:
-            ## for Json lines, we can use the following code to write each record as a separate line in the S3 object.
-            s3.put_object(Bucket="nyc311-bucket", Key=s3_key, Body="".join(json.dumps(record) + "\n" for record in page_data))
-            records_in_page = len(page_data)
-            total_records_ingested += records_in_page
-            print(f"Uploaded {records_in_page} records to S3 bucket at {s3_key}")
-        except Exception as e:
-            print(f"Error occurred while uploading data to {s3_key}: {e}")
-            raise
-
+        write_page(s3_prefix, page_number, page_data)
         offset += limit
         page_number += 1
 
-load_recent_data()
+if __name__ == "__main__":
+    load_recent_data()
 
 
-
-
-
-
+        
