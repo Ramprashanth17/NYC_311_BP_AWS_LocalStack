@@ -9,7 +9,8 @@ import requests
 import os
 import boto3
 import time
-from datetime import timedelta, datetime
+import argparse # library to make scripts invoke the functions.
+from datetime import timedelta, datetime, date
 from dotenv import load_dotenv
 
 load_dotenv() # Load environment variables from a .env file, which is useful for storing sensitive information like API tokens.
@@ -24,15 +25,8 @@ s3 = boto3.client(
     region_name="us-east-1"
 )
 
-current_date = datetime.now().date()
-target_date = current_date - timedelta(days=1)  # Targeting the previous day's data for ingestion. 
 
-
-year = target_date.strftime("%Y")
-month = target_date.strftime("%m")
-day = target_date.strftime("%d")
-target_start_date = target_date.strftime("%Y-%m-%dT00:00:00") # Setting the start of the target date for filtering records.
-target_end_date = target_date.strftime("%Y-%m-%dT23:59:59") # Setting the end of the target date for filtering records.
+# Setting the end of the target date for filtering records.
 
 """
 API Settings and Details:
@@ -52,12 +46,8 @@ headers = {
 
 
 ## Setting some variables for limit, offset, and page number for pagination. We will use these variables to download the data in smaller chunks, and to keep track of the progress of the ingestion process.
-
-limit = 2000
-offset = 0
-page_number = 0
 bucket = "nyc311-bucket"
-s3_prefix = f"bronze/nyc311/{year}-{month}-{day}/"
+
 
 ### Variables for retries
 max_retries = 5
@@ -99,10 +89,11 @@ def get_resume_point(s3_prefix: str, limit: int) -> tuple[int, int]:
     resume_page = last_page + 1
     return resume_page, resume_page * limit
 
-def fetch_page(offset: int, limit: int) -> list:
+def fetch_page(offset: int, limit: int, target_date: date) -> list:
     """One paginated API call. Returns parsed JSON list (empty list = no data).
-    Added exponential backoff for addressing network failures, etc."""
-    
+    Added exponential backoff for addressing network failures, etc.""" 
+    target_start_date = target_date.strftime("%Y-%m-%dT00:00:00") # Setting the start of the target date for filtering records.
+    target_end_date = target_date.strftime("%Y-%m-%dT23:59:59") 
     params = {
         "$limit":limit,
         "$offset":offset,
@@ -112,7 +103,7 @@ def fetch_page(offset: int, limit: int) -> list:
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.get(nyc_311_endpoint, headers=headers, params=params, timeout=60)
-            response.raise_for_status
+            response.raise_for_status()
             return response.json()
         # In case of timeout exception
         except requests.exceptions.Timeout:
@@ -156,7 +147,28 @@ def mark_complete(s3_prefix:str) -> None:
     """Written only after every page for the day is ingested, and succeeded, a metafile to prove that ingestion was successful"""
     s3.put_object(Bucket=bucket, Key=f"{s3_prefix}_SUCCESS", Body=b"")
 
-def load_recent_data() -> None:
+def run_daily() -> None:
+    target_date = datetime.now().date() - timedelta(days=1)
+    ingest_data(target_date)
+
+def run_backfill(start_date: date, end_date: date) -> None:
+    current_date = start_date
+    while current_date <= end_date:
+        ingest_data(current_date)
+        current_date += timedelta(days=1) 
+
+def parse_date(date_str: str) -> date:
+    return datetime.strptime(date_str, "%y-%m-%d").date()
+
+def ingest_data(date: date) -> None:
+    year = date.strftime("%Y")
+    month = date.strftime("%m")
+    day = date.strftime("%d")
+    s3_prefix = f"bronze/nyc311/{year}-{month}-{day}/"
+    limit = 2000
+    offset = 0
+    page_number = 0
+
     if is_day_complete(s3_prefix):
         print(f"{year}-{month}-{day} already completed. Skipping... ")
         return
@@ -168,7 +180,7 @@ def load_recent_data() -> None:
         print(f"No existing data for {year}-{month}-{day}. Starting afresh.")
 
     while True:
-        page_data = fetch_page(offset, limit)
+        page_data = fetch_page(offset, limit, date)
         if not page_data:
             mark_complete(s3_prefix)
             print(f"Finished. {year}-{month}-{day}. Marked complete")
@@ -178,7 +190,22 @@ def load_recent_data() -> None:
         page_number += 1
 
 if __name__ == "__main__":
-    load_recent_data()
+    parser = argparse.ArgumentParser(description="NYC-311 ingestion -daily or backfill mode")
+    subparsers = parser.add_subparsers(dest="mode", required= True)
+    subparsers.add_parser("daily")
+    backfill_parser = subparsers.add_parser("backfill")
+    backfill_parser.add_argument("start_date", type=parse_date, help="YYYY-MM-DD")
+    backfill_parser.add_argument("end_date", type=parse_date, help="YYYY-MM-DD")
+
+    args = parser.parse_args()
+
+    if args.mode == "daily":
+        run_daily()
+    elif args.mode == "backfill":
+        run_backfill(args.start_date, args.end_date)
+
+
+    ingest_data()
 
 
         
