@@ -26,6 +26,7 @@ s3 = boto3.client(
 current_date = datetime.now().date()
 target_date = current_date - timedelta(days=1)  # Targeting the previous day's data for ingestion. 
 
+
 year = target_date.strftime("%Y")
 month = target_date.strftime("%m")
 day = target_date.strftime("%d")
@@ -48,6 +49,7 @@ headers = {
     "X-App-Token": os.getenv("X-APP-TOKEN")  # Token to go beyond the 1000 records limit, and avoid rate limiting. It is stored in the .env file for security reasons.      
 }
 
+
 ## Setting some variables for limit, offset, and page number for pagination. We will use these variables to download the data in smaller chunks, and to keep track of the progress of the ingestion process.
 
 limit = 2000
@@ -55,6 +57,7 @@ offset = 0
 page_number = 0
 bucket = "nyc311-bucket"
 s3_prefix = f"bronze/nyc311/{year}-{month}-{day}/"
+
 
 
 def is_day_complete(s3_prefix: str) -> bool:
@@ -65,7 +68,7 @@ def is_day_complete(s3_prefix: str) -> bool:
         s3.head_object(Bucket=bucket, Key=f"{s3_prefix}_SUCCESS")
         return True
     except s3.exceptions.ClientError  as e:
-        if e.response["Error"]["Code"] in (404, 'NoSuchKey'):
+        if e.response["Error"]["Code"] in ("404", 'NoSuchKey'):
             print(f"Data for {s3_prefix} is not present. Proceeding with the EL logic")
             return False
         else:
@@ -86,8 +89,8 @@ def get_resume_point(s3_prefix: str, limit: int) -> tuple[int, int]:
                 page_num = int(key.split("page_")[1].replace(".json", ""))
                 existing_pages.append(page_num)
 
-        if not existing_pages:
-            return 0, 0
+    if not existing_pages:
+        return 0, 0
 
     last_page = max(existing_pages)
     resume_page = last_page + 1
