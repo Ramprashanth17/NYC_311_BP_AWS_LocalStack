@@ -8,6 +8,7 @@ import json
 import requests
 import os
 import boto3
+import time
 from datetime import timedelta, datetime
 from dotenv import load_dotenv
 
@@ -58,7 +59,9 @@ page_number = 0
 bucket = "nyc311-bucket"
 s3_prefix = f"bronze/nyc311/{year}-{month}-{day}/"
 
-
+### Variables for retries
+max_retries = 5
+wait_interval_seconds = 10
 
 def is_day_complete(s3_prefix: str) -> bool:
     """ Returns True is _SUCCESS file available in the day's partition marking ingestion as success. 
@@ -97,16 +100,50 @@ def get_resume_point(s3_prefix: str, limit: int) -> tuple[int, int]:
     return resume_page, resume_page * limit
 
 def fetch_page(offset: int, limit: int) -> list:
-    """One paginated API call. Returns parsed JSON list (empty list = no data)"""
+    """One paginated API call. Returns parsed JSON list (empty list = no data).
+    Added exponential backoff for addressing network failures, etc."""
+    
     params = {
         "$limit":limit,
         "$offset":offset,
         "$order": "created_date ASC, unique_key ASC",
         "$where": f"created_date > '{target_start_date}' and created_date <= '{target_end_date}'"
     }
-    response = requests.get(nyc_311_endpoint, params=params, headers=headers, timeout=60)
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(nyc_311_endpoint, headers=headers, params=params, timeout=60)
+            response.raise_for_status
+            return response.json()
+        # In case of timeout exception
+        except requests.exceptions.Timeout:
+            print(f"[Attempt {attempt}/{max_retries}] Timeout-retrying.")
+        # In case of Connection error
+        except requests.exceptions.ConnectionError:
+            print(f"[Attempt {attempt}/{max_retries}] Connection dropped -retrying.")
+        # In case of other exceptions, such as 400, 404, 405
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code
+            if status == 429:
+                print(f"[Attempt {attempt}/{max_retries}] Rate limited (429), retrying.")
+            elif status in (400, 404, 405):
+                print(f"Non-retryable error ({status}). Not retrying")
+                raise
+            else:
+                print(f"Unexpected HTTP error ({status}). Not retrying")
+                raise
+
+        # Exponential-backoff logic
+        if attempt < max_retries:
+            wait = wait_interval_seconds * ( 2 ** (attempt - 1))
+            print(f"Waiting {wait}s before retry....")
+            time.sleep(wait)
+
+    raise RuntimeError(f"fetch_page failed after {max_retries} attempts at offset {offset}")
+
+
+    # response = requests.get(nyc_311_endpoint, params=params, headers=headers, timeout=60)
+    # response.raise_for_status()
+    # return response.json()
 
 def write_page(s3_prefix: str, page_number:int, page_data:list) -> None:
     """Writes one page of data as newline-delimited JSON (JSONL) -streamable, not a single giant array"""
