@@ -158,7 +158,7 @@ def run_backfill(start_date: date, end_date: date) -> None:
         current_date += timedelta(days=1) 
 
 def parse_date(date_str: str) -> date:
-    return datetime.strptime(date_str, "%y-%m-%d").date()
+    return datetime.strptime(date_str, "%Y-%m-%d").date() #%Y= YYYY, %y=YY
 
 def ingest_data(date: date) -> None:
     year = date.strftime("%Y")
@@ -205,7 +205,7 @@ if __name__ == "__main__":
         run_backfill(args.start_date, args.end_date)
 
 
-    ingest_data()
+
 
 
         
